@@ -6,11 +6,18 @@ queued; up to `max_parallel` agent sessions run concurrently, each in its
 own git worktree with the PR head checked out. The agent posts the review
 back as a PR comment.
 
-Designed to run every minute from agentreviewer-watch.timer (systemd --user).
-Everything is configured via a TOML file — see config.example.toml.
+Reviews run either as transient `systemd-run --user` units (legacy mode)
+or as AgentControl daemon sessions (daemon mode — `new_session` NDJSON
+requests, tracked via `list_sessions`). Designed to run every minute from
+agentreviewer-watch.timer (systemd --user) or as a `process` component
+managed by agentcontrol-daemon (`--watch` loop, AGENTCONTROL_SOCK
+injected). Everything is configured via a TOML file — see
+config.example.toml.
 
 Usage:
   agent-reviewer [--config PATH]   one poll cycle (used by the systemd unit)
+  agent-reviewer --config PATH --watch [--interval SEC]
+                                   poll in-process every SEC seconds
   agent-reviewer --config PATH --dry-run
                                    detect pending comments, build prompts,
                                    create no worktree, spawn nothing
@@ -25,13 +32,16 @@ import glob
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from datetime import datetime, timedelta, timezone
 
 DEFAULT_CONFIG = "~/.config/agentreviewer/config.toml"
+DEFAULT_DAEMON_SOCK = "~/.agentcontrol/daemon.sock"
 DEFAULT_AGENT_ARGS = [
     "--model", "{model}",
     "--permission-mode", "dangerous",
@@ -39,10 +49,34 @@ DEFAULT_AGENT_ARGS = [
     "--prompt-file", "{prompt_file}",
     "--print",
 ]
+# Daemon session states meaning "the review is over" — anything else
+# (starting, idle, working, running, waiting_input, compacting, asleep)
+# counts as alive; a session absent from list_sessions is finished too.
+DEAD_STATES = {"dead", "interrupted"}
+# `origin` sent on new_session — marks sessions as spawned by this
+# watcher (client shows "via component:agentreviewer").
+DAEMON_ORIGIN = "component:agentreviewer"
 
 
 def expand(p):
     return os.path.abspath(os.path.expandvars(os.path.expanduser(p)))
+
+
+def parse_duration(s, default=10800.0):
+    """systemd-style time span ("3h", "90min", "1h30m", bare seconds)."""
+    units = {"us": 1e-6, "ms": 1e-3, "s": 1, "sec": 1, "m": 60, "min": 60,
+             "h": 3600, "hr": 3600, "d": 86400, "w": 604800}
+    total, n = 0.0, 0
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*(us|ms|min|sec|hr|s|m|h|d|w)",
+                         str(s), re.IGNORECASE):
+        total += float(m.group(1)) * units[m.group(2).lower()]
+        n += 1
+    if n:
+        return total
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return default
 
 
 def load_config(path):
@@ -68,7 +102,16 @@ def load_config(path):
                               str(raw.get("unit_prefix", "agentreviewer"))),
         "marker": str(raw.get("marker", "agentreviewer")),
         "post_acks": bool(raw.get("post_acks", True)),
+        "mode": str(raw.get("mode", "") or "").lower(),
+        "daemon": str(raw.get("daemon", "") or ""),
+        "group": str(raw.get("group", "AgentReviewer")),
+        "keep_sessions": bool(raw.get("keep_sessions", False)),
+        "session_title": str(raw.get(
+            "session_title", "review {repo} #{pr}")),
         "agent_cmd": str(agent.get("command", "devin")),
+        "agent_profile": str(agent.get(
+            "profile",
+            str(agent.get("command", "devin")).rsplit("/", 1)[-1])),
         "agent_args": [str(a) for a in agent.get("args", DEFAULT_AGENT_ARGS)],
         "model": str(agent.get("model", "swe-2-max")),
         "agent_env": {str(k): str(v) for k, v in agent.get("env", {}).items()},
@@ -77,6 +120,15 @@ def load_config(path):
             "AGENTREVIEWER_STATE_DIR",
             raw.get("state_dir", "~/.local/state/agentreviewer"))),
     }
+    if cfg["mode"] not in ("", "daemon", "systemd"):
+        sys.exit(f"agent-reviewer: config '{path}': mode must be "
+                 "'daemon' or 'systemd'")
+    try:
+        cfg["session_title"].format(repo="", pr=0, unit="", cid=0)
+    except (KeyError, IndexError, ValueError) as e:
+        sys.exit(f"agent-reviewer: config '{path}': bad session_title "
+                 f"template: {e}")
+    cfg["review_timeout_sec"] = parse_duration(cfg["review_timeout"])
     trig = r"\s+".join(re.escape(t) for t in cfg["trigger"].split())
     cfg["trigger_re"] = re.compile(trig + r"\s*", re.IGNORECASE)
     cfg["state_file"] = os.path.join(cfg["state_dir"], "state.json")
@@ -85,7 +137,9 @@ def load_config(path):
     return cfg
 
 
-CFG = None  # set in __main__
+CFG = None  # set in cli()
+DAEMON = None       # live AgentControl client for this cycle, or None
+USE_DAEMON = False  # spawn reviews via the daemon this cycle
 
 
 def log(msg):
@@ -142,17 +196,141 @@ def nvm_bin():
 
 
 def agent_desc():
-    d = CFG["agent_cmd"].rsplit("/", 1)[-1]
+    d = CFG["agent_profile"] if USE_DAEMON \
+        else CFG["agent_cmd"].rsplit("/", 1)[-1]
     return f"{d} ({CFG['model']})" if CFG["model"] else d
 
 
+class DaemonError(Exception):
+    """Connection failure or ok:false reply from agentcontrol-daemon."""
+
+
+class Daemon:
+    """Minimal AgentControl NDJSON client — one request per connection.
+
+    Wire format: one JSON line {"id":N,"req":"...",...} out, one reply
+    line {"id":N,"ok":true,"result":{...}} (or ok:false + "error") back.
+    No auth — the daemon only listens on loopback / a unix socket.
+    """
+
+    def __init__(self, endpoints, timeout=15):
+        self.endpoints = endpoints
+        self.timeout = timeout
+        self._seq = 0
+
+    def _connect(self):
+        err = None
+        for kind, *addr in self.endpoints:
+            try:
+                if kind == "unix":
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.settimeout(self.timeout)
+                    s.connect(addr[0])
+                else:
+                    s = socket.create_connection(
+                        (addr[0], addr[1]), timeout=self.timeout)
+                return s
+            except OSError as e:
+                err = e
+        raise DaemonError(f"no endpoint reachable ({err})")
+
+    def call(self, req, **fields):
+        self._seq += 1
+        msg = {"id": self._seq, "req": req, **fields}
+        try:
+            s = self._connect()
+        except DaemonError:
+            raise
+        try:
+            f = s.makefile("rwb")
+            f.write(json.dumps(msg).encode() + b"\n")
+            f.flush()
+            line = f.readline()
+        except OSError as e:
+            raise DaemonError(f"{req}: {e}") from e
+        finally:
+            s.close()
+        if not line:
+            raise DaemonError(f"{req}: connection closed")
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise DaemonError(f"{req}: bad reply: {e}") from e
+        if not r.get("ok"):
+            raise DaemonError(r.get("error") or f"{req} failed")
+        return r.get("result") or {}
+
+
+def _endpoint(spec):
+    if spec == "unix" or spec.startswith("unix:"):
+        return ("unix", expand(spec[5:] or DEFAULT_DAEMON_SOCK))
+    spec = spec[4:] if spec.startswith("tcp:") else spec
+    host, _, port = spec.rpartition(":")
+    return ("tcp", host or "127.0.0.1", int(port or "7331"))
+
+
+def daemon_endpoints():
+    """Candidates in order: the `daemon` config key is an exclusive
+    override; otherwise $AGENTCONTROL_SOCK > $AGENTCONTROL_TCP >
+    the default unix socket."""
+    if CFG["daemon"]:
+        return [_endpoint(CFG["daemon"])]
+    eps = []
+    if os.environ.get("AGENTCONTROL_SOCK"):
+        eps.append(("unix", expand(os.environ["AGENTCONTROL_SOCK"])))
+    if os.environ.get("AGENTCONTROL_TCP"):
+        eps.append(_endpoint("tcp:" + os.environ["AGENTCONTROL_TCP"]))
+    eps.append(("unix", expand(DEFAULT_DAEMON_SOCK)))
+    seen = set()
+    return [e for e in eps if not (e in seen or seen.add(e))]
+
+
+def daemon_mode_enabled():
+    """Resolved spawn mode: explicit `mode` wins; otherwise daemon when
+    an endpoint is configured (`daemon` key or AGENTCONTROL_* env, which
+    the daemon injects when supervising the watcher as a component)."""
+    if CFG["mode"]:
+        return CFG["mode"] == "daemon"
+    return bool(CFG["daemon"] or os.environ.get("AGENTCONTROL_SOCK")
+                or os.environ.get("AGENTCONTROL_TCP"))
+
+
+def spawned_ref(e):
+    """What identifies a running review: daemon session id or unit name."""
+    return e.get("session") or e.get("unit")
+
+
+def entry_alive(e, sessions, busy_units):
+    """True = review still running, False = finished, None = unknown
+    (backend unreachable — don't act on it this cycle)."""
+    sid = e.get("session")
+    if sid:
+        if sessions is None:
+            return None
+        m = sessions.get(sid)
+        return m is not None and m.get("state") not in DEAD_STATES
+    return e.get("unit") in busy_units
+
+
+def timed_out(e):
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(
+            e.get("ts") or e.get("created_at"))).total_seconds()
+    except (TypeError, ValueError):
+        return False
+    return age > CFG["review_timeout_sec"]
+
+
 def active_review_units():
-    out = subprocess.run(
-        ["systemctl", "--user", "list-units", "--type=service",
-         "--state=active,activating", "--no-legend", "--plain",
-         f"{CFG['unit_prefix']}-*"],
-        capture_output=True, text=True, timeout=30,
-    )
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "list-units", "--type=service",
+             "--state=active,activating", "--no-legend", "--plain",
+             f"{CFG['unit_prefix']}-*"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except OSError:
+        return set()  # no systemd on this host (e.g. managed container)
     if out.returncode not in (0, 1):
         return set()
     return {l.split()[0].removesuffix(".service")
@@ -283,17 +461,72 @@ def cleanup_worktrees(busy_units):
 
 
 def spawn_review(pr, comment, follow_up=False):
+    """Start a review — returns (unit/worktree name, session id or None)."""
     n, cid = pr["number"], comment["id"]
     unit = f"{CFG['unit_prefix']}-{n}-{cid}-{int(datetime.now().timestamp())}"
     if DRY_RUN:
         log(f"[dry-run] would spawn {unit} for PR #{n} "
             f"(comment {cid} by @{comment.get('user', {}).get('login')})")
-        return unit
+        return unit, None
     worktree = prepare_worktree(unit, n)
     prompt = build_prompt(pr, comment, worktree, follow_up)
     pfile = os.path.join(CFG["state_dir"], f"prompt-{n}-{cid}.txt")
     with open(pfile, "w") as f:
         f.write(prompt)
+    try:
+        sid = daemon_spawn(pr, cid, unit, worktree, prompt) \
+            if USE_DAEMON else systemd_spawn(n, cid, unit, worktree, pfile)
+    except Exception:
+        subprocess.run(
+            ["git", "-C", CFG["repo_dir"], "worktree", "remove",
+             "--force", worktree], capture_output=True, timeout=60)
+        raise
+    who = f"session {sid} ({unit})" if sid else unit
+    log(f"spawned {who} for PR #{n} "
+        f"(comment {cid} by @{comment.get('user', {}).get('login')})")
+    return unit, sid
+
+
+def daemon_spawn(pr, cid, unit, worktree, prompt):
+    """new_session on the daemon — the prompt is delivered inline as the
+    session's first message, wrapped with service provenance (`origin`)."""
+    title = CFG["session_title"].format(
+        repo=CFG["repo"], pr=pr["number"], unit=unit, cid=cid)
+    fields = {"agent": CFG["agent_profile"], "cwd": worktree,
+              "title": title, "prompt": prompt,
+              "origin": DAEMON_ORIGIN}
+    if CFG["model"]:
+        fields["model"] = CFG["model"]
+    if CFG["group"]:
+        fields["group"] = CFG["group"]
+    try:
+        res = DAEMON.call("new_session", **fields)
+    except DaemonError as ex:
+        if not str(ex).startswith("parse:"):
+            raise
+        # Older daemons may reject unknown keys — retry stripped down.
+        fields.pop("group", None)
+        try:
+            res = DAEMON.call("new_session", **fields)
+        except DaemonError as ex2:
+            if not str(ex2).startswith("parse:"):
+                raise
+            fields.pop("origin", None)
+            res = DAEMON.call("new_session", **fields)
+    sid = res.get("session")
+    if not sid:
+        raise RuntimeError(f"new_session: unexpected reply {res!r}")
+    # `group` is silently ignored by daemons predating the field — set it
+    # unconditionally; harmless if new_session already applied it.
+    if CFG["group"]:
+        try:
+            DAEMON.call("set_session_group", session=sid, group=CFG["group"])
+        except DaemonError as ex:
+            log(f"set_session_group {sid}: {ex} (session stays ungrouped)")
+    return sid
+
+
+def systemd_spawn(n, cid, unit, worktree, pfile):
     path = ":".join([os.path.expanduser("~/.local/bin"),
                      *CFG["path_extra"],
                      nvm_bin() or "/nonexistent",
@@ -315,13 +548,8 @@ def spawn_review(pr, comment, follow_up=False):
     cmd += [CFG["agent_cmd"], *agent_argv]
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if out.returncode != 0:
-        subprocess.run(
-            ["git", "-C", CFG["repo_dir"], "worktree", "remove",
-             "--force", worktree], capture_output=True, timeout=60)
         raise RuntimeError(f"systemd-run failed: {out.stderr.strip()[:300]}")
-    log(f"spawned {unit} for PR #{n} "
-        f"(comment {cid} by @{comment.get('user', {}).get('login')})")
-    return unit
+    return None
 
 
 def post_ack(pr, comment, unit=None, queue_pos=None, duplicate=False):
@@ -413,21 +641,98 @@ def main():
 
     busy_units = active_review_units()
 
-    # Recover reviews whose unit vanished without a posted review
-    # (reboot, crash, OOM). Transient units don't survive a reboot.
+    # Daemon backend for this cycle: sessions map or None (unreachable).
+    global DAEMON, USE_DAEMON
+    DAEMON, sessions = None, None
+    if daemon_mode_enabled() or any(e.get("session")
+                                    for e in seen.values()):
+        DAEMON = Daemon(daemon_endpoints())
+        try:
+            sessions = {m.get("id"): m
+                        for m in DAEMON.call("list_sessions") or []}
+        except DaemonError as ex:
+            log(f"daemon unreachable: {ex}")
+            DAEMON = None
+    USE_DAEMON = daemon_mode_enabled()
+    if USE_DAEMON and DAEMON is None:
+        if CFG["mode"] == "daemon":
+            save_state(state)
+            raise RuntimeError(
+                "mode=daemon: no AgentControl endpoint reachable")
+        log("daemon endpoints unreachable — new spawns fall back "
+            "to systemd-run this cycle")
+        USE_DAEMON = False
+
+    def reap(e):
+        """Free a finished daemon session: delete it (or just kill the
+        agent when keep_sessions keeps the journal). Retried on failure."""
+        sid = e.get("session")
+        if not sid or DAEMON is None:
+            return
+        if sid not in sessions:
+            e.pop("session", None)
+            return
+        try:
+            if CFG["keep_sessions"]:
+                DAEMON.call("kill_session", session=sid)
+            else:
+                DAEMON.call("delete_session", session=sid)
+            sessions[sid] = {"state": "dead"}
+            e.pop("session", None)
+        except DaemonError as ex:
+            log(f"reaping session {sid} failed: {ex} — retry next cycle")
+
+    def discard(e):
+        """Forget a failed session (killed or dead without verdict) —
+        like reap but best-effort and skipped under keep_sessions."""
+        sid = e.get("session")
+        if sid and DAEMON is not None and sid in sessions \
+                and not CFG["keep_sessions"]:
+            try:
+                DAEMON.call("delete_session", session=sid)
+            except DaemonError:
+                pass
+            sessions.pop(sid, None)
+
+    # Recover reviews whose unit/session ended without a posted review
+    # (reboot, crash, OOM). Transient units don't survive a reboot; a
+    # daemon session that stays alive past review_timeout is killed the
+    # same way RuntimeMaxSec used to kill the unit.
     for cid, e in seen.items():
-        if e.get("status") == "spawned" and e.get("unit") not in busy_units:
-            res = review_posted(e)
-            if res is True:
-                e["status"] = "done"
-                log(f"review for comment {cid} on PR #{e['pr_num']}: "
-                    "posted — done")
-            elif res is False:
-                e["status"] = "queued"
-                e["attempts"] = 0
-                e.pop("unit", None)
-                log(f"review for comment {cid} on PR #{e['pr_num']}: unit "
-                    "ended without a posted review — re-queued")
+        if e.get("status") != "spawned":
+            continue
+        a = entry_alive(e, sessions, busy_units)
+        if a is None and not timed_out(e):
+            continue
+        if a and e.get("session") and timed_out(e) and DAEMON is not None:
+            try:
+                DAEMON.call("kill_session", session=e["session"])
+                sessions[e["session"]] = {"state": "dead"}
+                discard(e)
+            except DaemonError as ex:
+                log(f"kill_session {e['session']} failed: {ex}")
+                continue
+            log(f"review for comment {cid} on PR #{e['pr_num']}: "
+                f"timed out after {CFG['review_timeout']} — killed")
+            a = False
+        res = review_posted(e)
+        if res is True:
+            e["status"] = "done"
+            log(f"review for comment {cid} on PR #{e['pr_num']}: "
+                "posted — done")
+            reap(e)
+        elif res is False and not a:
+            e["status"] = "queued"
+            e["attempts"] = 0
+            discard(e)
+            e.pop("unit", None)
+            e.pop("session", None)
+            log(f"review for comment {cid} on PR #{e['pr_num']}: "
+                "session ended without a posted review — re-queued")
+
+    for e in seen.values():
+        if e.get("status") == "done" and e.get("session"):
+            reap(e)
 
     queued = sorted(
         (e for e in seen.values() if e.get("status") == "queued"),
@@ -440,7 +745,8 @@ def main():
                 continue
             if e.get("status") == "queued":
                 return True
-            if e.get("status") == "spawned" and e.get("unit") in busy_units:
+            if e.get("status") == "spawned" \
+                    and entry_alive(e, sessions, busy_units) is not False:
                 return True
         return False
 
@@ -473,27 +779,51 @@ def main():
         log(f"queued '{CFG['trigger']}' on PR #{c['_pr']} "
             f"(comment {cid} by @{c.get('user', {}).get('login')})")
 
+    # Busy = live tracked refs + foreign units/sessions occupying slots.
+    # Untracked daemon sessions only count via the service provenance —
+    # a session merely parked in the sidebar group is not a review.
+    by_ref = {}
+    busy_refs = set(busy_units)
+    if sessions:
+        for m in sessions.values():
+            if m.get("origin") == DAEMON_ORIGIN \
+                    and m.get("state") not in DEAD_STATES:
+                busy_refs.add(m.get("id"))
+    for cid, e in seen.items():
+        if e.get("status") == "spawned" and spawned_ref(e):
+            by_ref[spawned_ref(e)] = (cid, e)
+            if entry_alive(e, sessions, busy_units) is not False:
+                busy_refs.add(spawned_ref(e))
+
     q_prs = len({e["pr_num"] for e in queued})
     log(f"queue: {len(queued)} pending review request(s) on {q_prs} PR(s), "
-        f"{len(busy_units)}/{CFG['max_parallel']} slot(s) busy")
-    by_unit = {e.get("unit"): (cid, e) for cid, e in seen.items()}
-    for u in sorted(busy_units):
-        if u in by_unit:
-            cid, e = by_unit[u]
+        f"{len(busy_refs)}/{CFG['max_parallel']} slot(s) busy")
+    for u in sorted(busy_refs):
+        if u in by_ref:
+            cid, e = by_ref[u]
             author = (e.get("comment", {}).get("user") or {}).get("login", "?")
             log(f"in-flight: PR #{e.get('pr_num')} comment {cid} (@{author})"
                 f" — {u}, running {fmt_age(e.get('ts'))}")
         else:
             log(f"in-flight: {u} (untracked)")
 
-    slots = CFG["max_parallel"] - len(busy_units)
+    def busy_worktrees():
+        # Worktree dirs in use — every in-flight entry plus live foreign
+        # units. Evaluated lazily: spawned-this-cycle worktrees must not
+        # be reaped by the cleanup running after the spawn loop.
+        wt = set(busy_units)
+        wt.update(e["unit"] for e in seen.values()
+                  if e.get("status") == "spawned" and e.get("unit"))
+        return wt
+
+    slots = CFG["max_parallel"] - len(busy_refs)
     if slots <= 0 or not queued:
         if not DRY_RUN:
             for i, e in enumerate(queued):
                 if not e.get("ack"):
                     post_ack(e["pr"], e["comment"], queue_pos=i + 1)
                     e["ack"] = True
-        cleanup_worktrees(busy_units)
+        cleanup_worktrees(busy_worktrees())
         save_state(state)
         return
 
@@ -512,11 +842,16 @@ def main():
                 and x.get("status") in ("spawned", "seeded", "done")
                 and (x.get("pr_num") or x.get("pr")) == e["pr_num"]
                 for x in seen.values())
-            e["unit"] = spawn_review(e["pr"], e["comment"], follow_up)
+            e["unit"], sid = spawn_review(
+                e["pr"], e["comment"], follow_up)
+            if sid:
+                e["session"] = sid
+                sessions[sid] = {"id": sid, "state": "starting",
+                                 "group": CFG["group"]}
             e["status"] = "dry-run" if DRY_RUN else "spawned"
             e["worktree"] = os.path.join(CFG["worktree_root"], e["unit"])
             if not DRY_RUN:
-                post_ack(e["pr"], e["comment"], unit=e["unit"])
+                post_ack(e["pr"], e["comment"], unit=sid or e["unit"])
                 slots -= 1
         except Exception as ex:
             if e["attempts"] >= CFG["max_attempts"]:
@@ -525,26 +860,43 @@ def main():
                 f"(attempt {e['attempts']}): {ex}")
         e["ts"] = datetime.now(timezone.utc).isoformat()
 
-    cleanup_worktrees(busy_units)
+    cleanup_worktrees(busy_worktrees())
     save_state(state)
 
 
-if __name__ == "__main__":
+def cli():
+    global DRY_RUN, SEED_ONLY, CFG
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--config", default=os.environ.get(
         "AGENTREVIEWER_CONFIG", expand(DEFAULT_CONFIG)))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--seed", action="store_true")
+    ap.add_argument("--watch", action="store_true",
+                    help="loop poll cycles in-process (managed-component "
+                         "mode; the daemon restarts on failure)")
+    ap.add_argument("--interval", type=int, metavar="SEC",
+                    default=int(os.environ.get(
+                        "AGENTREVIEWER_INTERVAL", "60")),
+                    help="seconds between cycles in --watch mode")
     args = ap.parse_args()
 
     DRY_RUN = args.dry_run
     SEED_ONLY = args.seed
     CFG = load_config(args.config)
 
-    try:
-        main()
-    except fcntl.error:
-        log("another instance is running, skipping")
-    except Exception as e:
-        log(f"error: {e}")
-        sys.exit(1)
+    while True:
+        try:
+            main()
+        except BlockingIOError:
+            log("another instance is running, skipping")
+        except Exception as e:
+            log(f"error: {e}")
+            if not args.watch:
+                sys.exit(1)
+        if not args.watch:
+            break
+        time.sleep(max(5, args.interval))
+
+
+if __name__ == "__main__":
+    cli()

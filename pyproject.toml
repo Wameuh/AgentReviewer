@@ -1,0 +1,14 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentreviewer"
+version = "0.2.0"
+description = "Self-hosted GitHub PR review bot — spawns AI review sessions on trigger comments"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+agent-reviewer = "agentreviewer:cli"

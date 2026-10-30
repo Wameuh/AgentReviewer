@@ -23,12 +23,42 @@ worktree_root = "/path/to/review-worktrees"
 # comment does not trigger.
 trigger = "/agent review"
 
+# --- Spawn backend ------------------------------------------------------------
+
+# Where reviews run. Empty = auto: daemon when an endpoint is configured
+# (`daemon` key or AGENTCONTROL_SOCK/AGENTCONTROL_TCP env, injected when
+# agentcontrol-daemon supervises the watcher as a `process` component),
+# systemd otherwise. With an unset `mode`, an unreachable daemon falls
+# back to systemd-run for new spawns (tracked daemon reviews keep their
+# own tracking). `mode = "daemon"` fails the cycle cleanly instead.
+# mode = ""
+
+# Force the daemon endpoint: "unix" (default socket), "unix:/path",
+# "tcp:host:port". Overrides AGENTCONTROL_SOCK/AGENTCONTROL_TCP; the
+# default fallback is ~/.agentcontrol/daemon.sock. Remote watchers must
+# tunnel (ssh -N -L <port>:127.0.0.1:7331 <daemon-host>) — the daemon
+# only listens on loopback, never expose it.
+# daemon = "unix"
+
+# Sidebar group assigned to review sessions (set_session_group is always
+# called after spawn — safe on daemons without new_session.group).
+# group = "AgentReviewer"
+
+# Session title template — placeholders {repo} {pr} {unit} {cid}.
+# session_title = "review {repo} #{pr}"
+
+# keep_sessions = true keeps the session journal after a review (the
+# agent is still killed; only the record stays). Default: sessions are
+# deleted once done — the verdict lives on GitHub.
+# keep_sessions = false
+
 # --- Queue / scheduling -------------------------------------------------------
 
 # How many review sessions may run concurrently (each in its own worktree).
 max_parallel = 1
 
-# Hard per-review timeout (systemd RuntimeMaxSec — accepts "3h", "90min", …).
+# Hard per-review timeout (systemd RuntimeMaxSec in systemd mode, a
+# kill_session after the same span in daemon mode — "3h", "90min", …).
 review_timeout = "3h"
 
 # Respawn attempts before a request is marked failed.
@@ -38,7 +68,8 @@ max_attempts = 5
 # overlapped by this many seconds. Dedup is by comment id — safe to keep.
 since_overlap_sec = 600
 
-# Prefix of the transient systemd units that run reviews.
+# Prefix naming per-review worktrees (and transient units in systemd
+# mode — unit names are unused in daemon mode).
 unit_prefix = "agentreviewer"
 
 # HTML marker the agent must append to its review comment; also used to
@@ -55,12 +86,22 @@ post_acks = true
 # --- Review agent -------------------------------------------------------------
 
 [agent]
-# Executable spawned per review via `systemd-run --user`.
+# Agent to run. In systemd mode: the executable spawned via
+# `systemd-run --user`. In daemon mode: the basename doubles as the
+# daemon agent profile (unless `profile` overrides it) — the profile
+# owns the command/env, so `args`, `env` and `path_extra` below are
+# ignored and the profile is assumed already trusted (like the
+# backlog-orchestrator sessions).
 command = "devin"
+
+# Daemon agent profile name — defaults to the basename of `command`.
+# profile = "devin"
 
 # Argument list; placeholders {prompt_file} {model} {repo} {pr} {worktree}
 # are substituted at spawn time. The prompt file instructs the agent to
 # read the PR diff and post back a `## Verdict: …` comment.
+# (systemd mode only — daemon mode passes the prompt inline to
+# new_session.)
 args = [
   "--model", "{model}",
   "--permission-mode", "dangerous",
