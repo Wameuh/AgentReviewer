@@ -16,6 +16,36 @@ repo_dir = "/path/to/local/clone"
 # REQUIRED.
 worktree_root = "/path/to/review-worktrees"
 
+# --- Additional watched repositories ------------------------------------------
+#
+# Watch several repositories with one instance. The top-level repo /
+# repo_dir / worktree_root above are the "primary" repo — each entry
+# below is an additional watched repo requiring its own `repo` and
+# `repo_dir` (fail-fast at load when missing, naming the index).
+# `worktree_root` is required too but may be inherited from the top
+# level. Every overridable key — worktree_root, trigger, group,
+# session_title, max_parallel, keep_sessions, post_acks, marker,
+# review_timeout, max_attempts, since_overlap_sec, unit_prefix — falls
+# back to the top-level value when absent, and a nested `agent` table
+# (command/profile/model/args/env/path_extra) merges over [agent].
+#
+# State is namespaced per repo (comment ids can't collide across repos),
+# queues/slots are per repo, and worktree/unit names carry the repo slug
+# (e.g. agentreviewer-lib-42-…) so identical PR numbers never collide.
+#
+# Inline form (what AgentControl's managed component generates):
+# repos = [ { repo = "o/lib", repo_dir = "/path/lib", max_parallel = 2 } ]
+#
+# Or the classic array-of-tables form:
+# [[repos]]
+# repo = "o/lib"
+# repo_dir = "/path/lib"
+# trigger = "/check"
+# [repos.agent]
+# model = "swe-2-mini"
+#
+# Repos can also be given WITHOUT a top-level repo (entries only).
+
 # --- Trigger ------------------------------------------------------------------
 
 # Comment that requests a review. Matched as a BARE comment only

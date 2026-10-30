@@ -2,9 +2,11 @@
 """AgentReviewer — watch GitHub PRs for review-trigger comments.
 
 Each new bare trigger comment (e.g. `/agent review`) on an open PR is
-queued; up to `max_parallel` agent sessions run concurrently, each in its
-own git worktree with the PR head checked out. The agent posts the review
-back as a PR comment.
+queued; up to `max_parallel` agent sessions run concurrently per watched
+repository, each in its own git worktree with the PR head checked out.
+The agent posts the review back as a PR comment. A single instance can
+watch several repositories (`repos = [ { … } ]`, per-entry overrides
+falling back to the top-level defaults; state is namespaced per repo).
 
 Reviews run either as transient `systemd-run --user` units (legacy mode)
 or as AgentControl daemon sessions (daemon mode — `new_session` NDJSON
@@ -24,6 +26,14 @@ Usage:
   agent-reviewer --config PATH --seed
                                    mark all current matching comments as
                                    processed, spawn nothing
+  agent-reviewer review --path DIR --base REF [--out FILE]
+                                   [--timeout SEC] [--detach]
+                                   review the local diff REF...HEAD in an
+                                   existing worktree — daemon session when
+                                   an endpoint is reachable, foreground
+                                   agent run otherwise. Exit code:
+                                   0=APPROVED 4=CONDITIONAL 5=REJECTED
+                                   3=no verdict/timeout 2=usage/infra error
 """
 
 import argparse
@@ -40,7 +50,7 @@ import time
 import tomllib
 from datetime import datetime, timedelta, timezone
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 DEFAULT_CONFIG = "~/.config/agentreviewer/config.toml"
 DEFAULT_DAEMON_SOCK = "~/.agentcontrol/daemon.sock"
@@ -81,20 +91,32 @@ def parse_duration(s, default=10800.0):
         return default
 
 
-def load_config(path):
-    with open(path, "rb") as f:
-        raw = tomllib.load(f)
+def _agent_fields(a):
+    return {
+        "agent_cmd": str(a.get("command", "devin")),
+        "agent_profile": str(a.get(
+            "profile",
+            str(a.get("command", "devin")).rsplit("/", 1)[-1])),
+        "agent_args": [str(x) for x in a.get("args", DEFAULT_AGENT_ARGS)],
+        "model": str(a.get("model", "swe-2-max")),
+        "agent_env": {str(k): str(v) for k, v in a.get("env", {}).items()},
+        "path_extra": [expand(p) for p in a.get("path_extra", [])],
+    }
 
-    def req(key):
-        if not raw.get(key):
-            sys.exit(f"agent-reviewer: config '{path}': missing required '{key}'")
-        return raw[key]
 
-    agent = raw.get("agent", {})
+def load_config(path, allow_missing=False):
+    try:
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+    except FileNotFoundError:
+        if not allow_missing:
+            raise
+        raw = {}
+
     cfg = {
-        "repo": req("repo"),
-        "repo_dir": expand(req("repo_dir")),
-        "worktree_root": expand(req("worktree_root")),
+        "repo": raw.get("repo"),
+        "repo_dir": raw.get("repo_dir"),
+        "worktree_root": raw.get("worktree_root"),
         "trigger": str(raw.get("trigger", "/agent review")),
         "max_parallel": max(1, int(raw.get("max_parallel", 1))),
         "review_timeout": str(raw.get("review_timeout", "3h")),
@@ -110,14 +132,7 @@ def load_config(path):
         "keep_sessions": bool(raw.get("keep_sessions", False)),
         "session_title": str(raw.get(
             "session_title", "review {repo} #{pr}")),
-        "agent_cmd": str(agent.get("command", "devin")),
-        "agent_profile": str(agent.get(
-            "profile",
-            str(agent.get("command", "devin")).rsplit("/", 1)[-1])),
-        "agent_args": [str(a) for a in agent.get("args", DEFAULT_AGENT_ARGS)],
-        "model": str(agent.get("model", "swe-2-max")),
-        "agent_env": {str(k): str(v) for k, v in agent.get("env", {}).items()},
-        "path_extra": [expand(p) for p in agent.get("path_extra", [])],
+        **_agent_fields(raw.get("agent", {})),
         "state_dir": expand(os.environ.get(
             "AGENTREVIEWER_STATE_DIR",
             raw.get("state_dir", "~/.local/state/agentreviewer"))),
@@ -130,13 +145,89 @@ def load_config(path):
     except (KeyError, IndexError, ValueError) as e:
         sys.exit(f"agent-reviewer: config '{path}': bad session_title "
                  f"template: {e}")
-    cfg["review_timeout_sec"] = parse_duration(cfg["review_timeout"])
-    trig = r"\s+".join(re.escape(t) for t in cfg["trigger"].split())
-    cfg["trigger_re"] = re.compile(trig + r"\s*", re.IGNORECASE)
     cfg["state_file"] = os.path.join(cfg["state_dir"], "state.json")
     cfg["log_file"] = os.path.join(cfg["state_dir"], "watcher.log")
     cfg["lock_file"] = os.path.join(cfg["state_dir"], "lock")
+
+    cfg["repos"] = []
+    if cfg["repo"]:
+        cfg["repos"].append(_resolve_repo(cfg, cfg, path, "primary"))
+    for i, ent in enumerate(raw.get("repos", [])):
+        if not isinstance(ent, dict):
+            sys.exit(f"agent-reviewer: config '{path}': repos[{i}] "
+                     "must be a table")
+        cfg["repos"].append(_resolve_repo(cfg, ent, path, i))
     return cfg
+
+
+# Keys a `repos[]` entry may override; everything else stays global.
+REPO_OVERRIDES = ("worktree_root", "trigger", "group", "session_title",
+                  "max_parallel", "keep_sessions", "post_acks", "marker",
+                  "review_timeout", "max_attempts", "since_overlap_sec",
+                  "unit_prefix")
+
+
+def _resolve_repo(g, ent, path, idx):
+    """Fully-resolved per-repo config: global defaults + entry overrides."""
+    where = "primary repo (top-level keys)" if idx == "primary" \
+        else f"repos[{idx}]"
+
+    def need(key):
+        v = ent.get(key) or g.get(key)
+        if not v:
+            sys.exit(f"agent-reviewer: config '{path}': {where} "
+                     f"missing required '{key}'")
+        return v
+    rc = dict(g)
+    rc["repo"] = str(need("repo"))
+    rc["repo_dir"] = expand(str(need("repo_dir")))
+    rc["worktree_root"] = expand(str(need("worktree_root")))
+    for k in REPO_OVERRIDES:
+        if ent.get(k) is not None:
+            rc[k] = ent[k]
+    rc["trigger"] = str(rc["trigger"])
+    rc["group"] = str(rc["group"])
+    rc["session_title"] = str(rc["session_title"])
+    rc["max_parallel"] = max(1, int(rc["max_parallel"]))
+    rc["keep_sessions"] = bool(rc["keep_sessions"])
+    rc["post_acks"] = bool(rc["post_acks"])
+    rc["marker"] = str(rc["marker"])
+    rc["review_timeout"] = str(rc["review_timeout"])
+    rc["review_timeout_sec"] = parse_duration(rc["review_timeout"])
+    rc["max_attempts"] = int(rc["max_attempts"])
+    rc["since_overlap_sec"] = int(rc["since_overlap_sec"])
+    rc["unit_prefix"] = re.sub(r"[^a-zA-Z0-9_.-]", "-",
+                               str(rc["unit_prefix"]))
+    trig = r"\s+".join(re.escape(t) for t in rc["trigger"].split())
+    rc["trigger_re"] = re.compile(trig + r"\s*", re.IGNORECASE)
+    # [agent] fields: entry keys merge over the global table.
+    for k in ("agent_cmd", "agent_profile", "agent_args",
+              "model", "agent_env", "path_extra"):
+        rc[k] = g[k]
+    ea = ent.get("agent")
+    if isinstance(ea, dict):
+        if ea.get("command") is not None:
+            rc["agent_cmd"] = str(ea["command"])
+            rc["agent_profile"] = rc["agent_cmd"].rsplit("/", 1)[-1]
+        if ea.get("profile") is not None:
+            rc["agent_profile"] = str(ea["profile"])
+        if ea.get("args") is not None:
+            rc["agent_args"] = [str(x) for x in ea["args"]]
+        if ea.get("model") is not None:
+            rc["model"] = str(ea["model"])
+        if ea.get("env") is not None:
+            rc["agent_env"] = {str(k): str(v)
+                               for k, v in ea["env"].items()}
+        if ea.get("path_extra") is not None:
+            rc["path_extra"] = [expand(p) for p in ea["path_extra"]]
+    rc["slug"] = re.sub(r"[^a-zA-Z0-9_.-]", "-",
+                        rc["repo"].split("/")[-1])
+    try:
+        rc["session_title"].format(repo="", pr=0, unit="", cid=0)
+    except (KeyError, IndexError, ValueError) as e:
+        sys.exit(f"agent-reviewer: config '{path}': repos[{idx}] "
+                 f"bad session_title template: {e}")
+    return rc
 
 
 CFG = None  # set in cli()
@@ -176,11 +267,27 @@ def gh_api(endpoint):
 
 
 def load_state():
+    """State file = {"repos": {"owner/name": {"comments", "last_check"}}}.
+    A legacy flat {"comments", "last_check"} layout migrates into the
+    primary repo's namespace (configured repos[0])."""
     try:
         with open(CFG["state_file"]) as f:
-            return json.load(f)
+            st = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return {"last_check": None, "comments": {}}
+        st = {}
+    if not isinstance(st, dict):
+        st = {}
+    repos = st.setdefault("repos", {})
+    legacy = {k: st.pop(k) for k in ("comments", "last_check") if k in st}
+    if legacy and CFG["repos"]:
+        ns = repos.setdefault(CFG["repos"][0]["repo"], {})
+        log(f"state: migrated legacy entries into "
+            f"{CFG['repos'][0]['repo']} namespace")
+        if "comments" in legacy:
+            ns["comments"] = {**legacy["comments"],
+                              **ns.get("comments", {})}
+        ns.setdefault("last_check", legacy.get("last_check"))
+    return st
 
 
 def save_state(state):
@@ -197,10 +304,10 @@ def nvm_bin():
     return dirs[-1] if dirs else None
 
 
-def agent_desc():
-    d = CFG["agent_profile"] if USE_DAEMON \
-        else CFG["agent_cmd"].rsplit("/", 1)[-1]
-    return f"{d} ({CFG['model']})" if CFG["model"] else d
+def agent_desc(rc):
+    d = rc["agent_profile"] if USE_DAEMON \
+        else rc["agent_cmd"].rsplit("/", 1)[-1]
+    return f"{d} ({rc['model']})" if rc["model"] else d
 
 
 class DaemonError(Exception):
@@ -314,21 +421,21 @@ def entry_alive(e, sessions, busy_units):
     return e.get("unit") in busy_units
 
 
-def timed_out(e):
+def timed_out(rc, e):
     try:
         age = (datetime.now(timezone.utc) - datetime.fromisoformat(
             e.get("ts") or e.get("created_at"))).total_seconds()
     except (TypeError, ValueError):
         return False
-    return age > CFG["review_timeout_sec"]
+    return age > rc["review_timeout_sec"]
 
 
-def active_review_units():
+def active_review_units(prefix):
     try:
         out = subprocess.run(
             ["systemctl", "--user", "list-units", "--type=service",
              "--state=active,activating", "--no-legend", "--plain",
-             f"{CFG['unit_prefix']}-*"],
+             f"{prefix}-*"],
             capture_output=True, text=True, timeout=30,
         )
     except OSError:
@@ -339,11 +446,11 @@ def active_review_units():
             for l in out.stdout.splitlines() if l.strip()}
 
 
-def review_posted(entry):
+def review_posted(rc, entry):
     """True: review landed on the PR. False: none found. None: check failed."""
     try:
         comments = gh_api(
-            f"repos/{CFG['repo']}/issues/{entry['pr_num']}"
+            f"repos/{rc['repo']}/issues/{entry['pr_num']}"
             "/comments?per_page=100")
     except Exception as ex:
         log(f"review check failed for comment "
@@ -351,7 +458,7 @@ def review_posted(entry):
             f"(PR #{entry.get('pr_num')}): {ex}")
         return None
     trig = entry.get("created_at") or ""
-    marker = f"<!-- {CFG['marker']} -->"
+    marker = f"<!-- {rc['marker']} -->"
     for c in comments:
         if (c.get("created_at") or "") <= trig:
             continue
@@ -372,11 +479,11 @@ def fmt_age(ts):
         return "?"
 
 
-def build_prompt(pr, comment, worktree, follow_up=False):
-    repo = CFG["repo"]
+def build_prompt(rc, pr, comment, worktree, follow_up=False):
+    repo = rc["repo"]
     body = (comment.get("body") or "").strip()
     n = pr["number"]
-    header = f"""A user commented `{CFG['trigger']}` on a pull request on GitHub. The full event details are included below.
+    header = f"""A user commented `{rc['trigger']}` on a pull request on GitHub. The full event details are included below.
 
 Event details:
 - Repository: {repo}
@@ -394,7 +501,7 @@ Event details:
 Instructions:
 1. Verify the comment was posted on a pull request (issue_comment events also fire on plain issues; if this is not a PR, stop without posting anything)
 2. Read the PR title, body and follow-up comments for context (`gh pr view {n} -R {repo} --comments`)
-3. This is a FOLLOW-UP review: this PR was already reviewed at least once. Find the previous review comment(s) on the PR posted in response to earlier `{CFG['trigger']}` commands (they start with `## Verdict:` — older ones may use a `## Review` heading instead) and identify the commits pushed since the last one (`gh api repos/{repo}/pulls/{n}/commits` lists head SHAs and dates). If no previous review comment exists on the PR, review the full diff instead.
+3. This is a FOLLOW-UP review: this PR was already reviewed at least once. Find the previous review comment(s) on the PR posted in response to earlier `{rc['trigger']}` commands (they start with `## Verdict:` — older ones may use a `## Review` heading instead) and identify the commits pushed since the last one (`gh api repos/{repo}/pulls/{n}/commits` lists head SHAs and dates). If no previous review comment exists on the PR, review the full diff instead.
 4. Read ONLY the diff introduced by those new commits (for example `git diff <head-sha-at-last-review>...HEAD` in the worktree — the current PR head is already checked out), not the whole PR diff. If there are no new commits since the last review, say so briefly — do not redo the review.
 5. Analyze ONLY the new changes and their direct integration with the code they touch. Do NOT re-review code that was already reviewed, do NOT repeat earlier remarks, and do NOT comment on unrelated code — exception: you may still flag a genuinely blocking issue (security hole, data loss, broken build) still present.
 """
@@ -414,7 +521,7 @@ Your review comment MUST begin with a verdict line, exactly one of:
 - `## Verdict: REJECTED` — blocking issues must be fixed before merge
 
 Then add the review as a comment on the PR (`gh pr comment {n} -R {repo} --body-file <file>`).
-End the review comment with `<!-- {CFG['marker']} -->` on its own line.
+End the review comment with `<!-- {rc['marker']} -->` on its own line.
 """
 
 
@@ -423,27 +530,27 @@ def git(*args, cwd=None):
                           capture_output=True, text=True, timeout=300)
 
 
-def prepare_worktree(unit, pr_n):
+def prepare_worktree(rc, unit, pr_n):
     """Create a fresh per-review worktree with the PR head checked out."""
-    os.makedirs(CFG["worktree_root"], exist_ok=True)
-    wt = os.path.join(CFG["worktree_root"], unit)
-    for args in (["-C", CFG["repo_dir"], "worktree", "add", "--detach", wt],
+    os.makedirs(rc["worktree_root"], exist_ok=True)
+    wt = os.path.join(rc["worktree_root"], unit)
+    for args in (["-C", rc["repo_dir"], "worktree", "add", "--detach", wt],
                  ["-C", wt, "fetch", "origin", f"pull/{pr_n}/head"],
                  ["-C", wt, "checkout", "--detach", "FETCH_HEAD"]):
         out = subprocess.run(["git", *args],
                              capture_output=True, text=True, timeout=300)
         if out.returncode != 0:
             subprocess.run(
-                ["git", "-C", CFG["repo_dir"], "worktree", "remove",
+                ["git", "-C", rc["repo_dir"], "worktree", "remove",
                  "--force", wt], capture_output=True, timeout=60)
             raise RuntimeError(f"{' '.join(args[1:4])}… failed: "
                                f"{out.stderr.strip()[:200]}")
     return wt
 
 
-def cleanup_worktrees(busy_units):
+def cleanup_worktrees(rc, busy_units):
     """Drop per-review worktrees whose unit is gone (finished or dead)."""
-    root = CFG["worktree_root"]
+    root = rc["worktree_root"]
     if not os.path.isdir(root):
         return
     for name in sorted(os.listdir(root)):
@@ -451,36 +558,38 @@ def cleanup_worktrees(busy_units):
         if not os.path.isdir(wt) or name in busy_units:
             continue
         out = subprocess.run(
-            ["git", "-C", CFG["repo_dir"], "worktree", "remove",
+            ["git", "-C", rc["repo_dir"], "worktree", "remove",
              "--force", wt], capture_output=True, text=True, timeout=120)
         if out.returncode != 0:
             log(f"worktree cleanup: could not remove {wt}: "
                 f"{out.stderr.strip()[:150]}")
         else:
             log(f"worktree cleanup: removed {wt}")
-    subprocess.run(["git", "-C", CFG["repo_dir"], "worktree", "prune"],
+    subprocess.run(["git", "-C", rc["repo_dir"], "worktree", "prune"],
                    capture_output=True, timeout=60)
 
 
-def spawn_review(pr, comment, follow_up=False):
+def spawn_review(rc, pr, comment, follow_up=False):
     """Start a review — returns (unit/worktree name, session id or None)."""
     n, cid = pr["number"], comment["id"]
-    unit = f"{CFG['unit_prefix']}-{n}-{cid}-{int(datetime.now().timestamp())}"
+    repo_tag = f"{rc['slug']}-" if len(CFG["repos"]) > 1 else ""
+    unit = (f"{rc['unit_prefix']}-{repo_tag}{n}-{cid}-"
+            f"{int(datetime.now().timestamp())}")
     if DRY_RUN:
         log(f"[dry-run] would spawn {unit} for PR #{n} "
             f"(comment {cid} by @{comment.get('user', {}).get('login')})")
         return unit, None
-    worktree = prepare_worktree(unit, n)
-    prompt = build_prompt(pr, comment, worktree, follow_up)
-    pfile = os.path.join(CFG["state_dir"], f"prompt-{n}-{cid}.txt")
+    worktree = prepare_worktree(rc, unit, n)
+    prompt = build_prompt(rc, pr, comment, worktree, follow_up)
+    pfile = os.path.join(CFG["state_dir"], f"prompt-{rc['slug']}-{n}-{cid}.txt")
     with open(pfile, "w") as f:
         f.write(prompt)
     try:
-        sid = daemon_spawn(pr, cid, unit, worktree, prompt) \
-            if USE_DAEMON else systemd_spawn(n, cid, unit, worktree, pfile)
+        sid = daemon_spawn(rc, pr, cid, unit, worktree, prompt) \
+            if USE_DAEMON else systemd_spawn(rc, n, cid, unit, worktree, pfile)
     except Exception:
         subprocess.run(
-            ["git", "-C", CFG["repo_dir"], "worktree", "remove",
+            ["git", "-C", rc["repo_dir"], "worktree", "remove",
              "--force", worktree], capture_output=True, timeout=60)
         raise
     who = f"session {sid} ({unit})" if sid else unit
@@ -489,18 +598,23 @@ def spawn_review(pr, comment, follow_up=False):
     return unit, sid
 
 
-def daemon_spawn(pr, cid, unit, worktree, prompt):
+def daemon_spawn(rc, pr, cid, unit, worktree, prompt):
     """new_session on the daemon — the prompt is delivered inline as the
     session's first message, wrapped with service provenance (`origin`)."""
-    title = CFG["session_title"].format(
-        repo=CFG["repo"], pr=pr["number"], unit=unit, cid=cid)
-    fields = {"agent": CFG["agent_profile"], "cwd": worktree,
+    title = rc["session_title"].format(
+        repo=rc["repo"], pr=pr["number"], unit=unit, cid=cid)
+    return daemon_session(rc, worktree, title, prompt)
+
+
+def daemon_session(rc, cwd, title, prompt):
+    """new_session on the daemon — returns the session id."""
+    fields = {"agent": rc["agent_profile"], "cwd": cwd,
               "title": title, "prompt": prompt,
               "origin": DAEMON_ORIGIN}
-    if CFG["model"]:
-        fields["model"] = CFG["model"]
-    if CFG["group"]:
-        fields["group"] = CFG["group"]
+    if rc["model"]:
+        fields["model"] = rc["model"]
+    if rc["group"]:
+        fields["group"] = rc["group"]
     try:
         res = DAEMON.call("new_session", **fields)
     except DaemonError as ex:
@@ -520,46 +634,56 @@ def daemon_spawn(pr, cid, unit, worktree, prompt):
         raise RuntimeError(f"new_session: unexpected reply {res!r}")
     # `group` is silently ignored by daemons predating the field — set it
     # unconditionally; harmless if new_session already applied it.
-    if CFG["group"]:
+    if rc["group"]:
         try:
-            DAEMON.call("set_session_group", session=sid, group=CFG["group"])
+            DAEMON.call("set_session_group", session=sid, group=rc["group"])
         except DaemonError as ex:
             log(f"set_session_group {sid}: {ex} (session stays ungrouped)")
     return sid
 
 
-def systemd_spawn(n, cid, unit, worktree, pfile):
+def agent_argv_env(rc, worktree, fmt_extra):
+    """Shared argv+env builder for direct/systemd agent execution."""
     path = ":".join([os.path.expanduser("~/.local/bin"),
-                     *CFG["path_extra"],
+                     *rc["path_extra"],
                      nvm_bin() or "/nonexistent",
                      "/usr/local/bin", "/usr/bin", "/bin"])
-    fmt = {"prompt_file": pfile, "model": CFG["model"],
-           "repo": CFG["repo"], "pr": n, "worktree": worktree}
-    agent_argv = [a.format(**fmt) for a in CFG["agent_args"]]
+    fmt = {"model": rc["model"], "repo": rc["repo"] or "",
+           "worktree": worktree, "pr": "", "prompt_file": ""}
+    fmt.update(fmt_extra)
+    argv = [a.format(**fmt) for a in rc["agent_args"]]
+    env = dict(os.environ, PATH=path)
+    env.update(rc["agent_env"])
+    return argv, env
+
+
+def systemd_spawn(rc, n, cid, unit, worktree, pfile):
+    argv, env = agent_argv_env(
+        rc, worktree, {"prompt_file": pfile, "pr": n})
     cmd = [
         "systemd-run", "--user",
         f"--unit={unit}",
-        f"--description=AgentReviewer {CFG['repo']} PR #{n} comment {cid}",
+        f"--description=AgentReviewer {rc['repo']} PR #{n} comment {cid}",
         f"--property=WorkingDirectory={worktree}",
-        f"--property=RuntimeMaxSec={CFG['review_timeout']}",
-        "--setenv", f"PATH={path}",
+        f"--property=RuntimeMaxSec={rc['review_timeout']}",
+        "--setenv", f"PATH={env['PATH']}",
         "--collect",
     ]
-    for k, v in CFG["agent_env"].items():
+    for k, v in rc["agent_env"].items():
         cmd += ["--setenv", f"{k}={v}"]
-    cmd += [CFG["agent_cmd"], *agent_argv]
+    cmd += [rc["agent_cmd"], *argv]
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if out.returncode != 0:
         raise RuntimeError(f"systemd-run failed: {out.stderr.strip()[:300]}")
     return None
 
 
-def post_ack(pr, comment, unit=None, queue_pos=None, duplicate=False):
-    if not CFG["post_acks"]:
+def post_ack(rc, pr, comment, unit=None, queue_pos=None, duplicate=False):
+    if not rc["post_acks"]:
         return
     author = comment.get("user", {}).get("login", "")
     mention = f"@{author} " if author else ""
-    who = agent_desc()
+    who = agent_desc(rc)
     if duplicate:
         body = (f"{mention}A review request is already queued or running "
                 f"for this PR — ignoring this duplicate.")
@@ -571,10 +695,10 @@ def post_ack(pr, comment, unit=None, queue_pos=None, duplicate=False):
                 f"`{unit}`. The review will be posted as a comment on "
                 f"this PR.")
     if comment.get("_kind") == "review":
-        endpoint = (f"repos/{CFG['repo']}/pulls/{pr['number']}/comments/"
+        endpoint = (f"repos/{rc['repo']}/pulls/{pr['number']}/comments/"
                     f"{comment['id']}/replies")
     else:
-        endpoint = f"repos/{CFG['repo']}/issues/{pr['number']}/comments"
+        endpoint = f"repos/{rc['repo']}/issues/{pr['number']}/comments"
     try:
         out = subprocess.run(
             ["gh", "api", "-X", "POST", endpoint, "-f", f"body={body}"],
@@ -594,60 +718,16 @@ def ref_num(url, kind):
     return int(m.group(1)) if m else None
 
 
-def main():
-    os.makedirs(CFG["state_dir"], exist_ok=True)
-    lock = open(CFG["lock_file"], "w")
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-    state = load_state()
-    if state["last_check"] is None:
-        state["last_check"] = datetime.now(timezone.utc).isoformat()
-
-    prs = {p["number"]: p for p in gh_api(
-        f"repos/{CFG['repo']}/pulls?state=open&per_page=100")}
-    since_dt = (datetime.fromisoformat(state["last_check"])
-                - timedelta(seconds=CFG["since_overlap_sec"]))
-    since = since_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    log(f"scan: {len(prs)} open PR(s) since {since}")
-    candidates = []
-    for c in gh_api(
-            f"repos/{CFG['repo']}/issues/comments"
-            f"?since={since}&per_page=100"):
-        n = ref_num(c.get("issue_url"), "issues")
-        if n in prs:
-            c["_kind"], c["_pr"] = "issue", n
-            candidates.append(c)
-    for c in gh_api(
-            f"repos/{CFG['repo']}/pulls/comments"
-            f"?since={since}&per_page=100"):
-        n = ref_num(c.get("pull_request_url"), "pulls")
-        if n in prs:
-            c["_kind"], c["_pr"] = "review", n
-            candidates.append(c)
-
-    state["last_check"] = datetime.now(timezone.utc).isoformat()
-
-    seen = state["comments"]
-    fresh = [c for c in candidates
-             if str(c["id"]) not in seen
-             and CFG["trigger_re"].fullmatch((c.get("body") or "").strip())]
-    fresh.sort(key=lambda c: c.get("created_at", ""))
-
-    if SEED_ONLY or not os.path.exists(CFG["state_file"]):
-        for c in fresh:
-            seen[str(c["id"])] = {"status": "seeded", "pr": c["_pr"]}
-        save_state(state)
-        log(f"seeded {len(fresh)} existing trigger comment(s), "
-            "no reviews spawned")
-        return
-
-    busy_units = active_review_units()
-
-    # Daemon backend for this cycle: sessions map or None (unreachable).
+def daemon_setup(state):
+    """Connect to the daemon if this cycle needs it. Returns the session
+    metadata map ({id: {...}}) or None when unreachable."""
     global DAEMON, USE_DAEMON
     DAEMON, sessions = None, None
-    if daemon_mode_enabled() or any(e.get("session")
-                                    for e in seen.values()):
+    want = daemon_mode_enabled() or any(
+        e.get("session")
+        for rs in state["repos"].values()
+        for e in rs.get("comments", {}).values())
+    if want:
         DAEMON = Daemon(daemon_endpoints())
         try:
             sessions = {m.get("id"): m
@@ -658,12 +738,66 @@ def main():
     USE_DAEMON = daemon_mode_enabled()
     if USE_DAEMON and DAEMON is None:
         if CFG["mode"] == "daemon":
-            save_state(state)
             raise RuntimeError(
                 "mode=daemon: no AgentControl endpoint reachable")
         log("daemon endpoints unreachable — new spawns fall back "
             "to systemd-run this cycle")
         USE_DAEMON = False
+    return sessions
+
+
+def poll_repo(rc, rs, sessions, claimed_sids):
+    """One poll cycle for a single repository: scan comments, recover
+    dead reviews, then fill free slots from the queue."""
+    def rlog(msg):
+        log(f"[{rc['repo']}] {msg}")
+
+    # An empty namespace means this repo was never polled — seed existing
+    # triggers instead of reviewing the whole history at once.
+    first_run = not rs
+    seen = rs.setdefault("comments", {})
+    if rs.get("last_check") is None:
+        rs["last_check"] = datetime.now(timezone.utc).isoformat()
+
+    prs = {p["number"]: p for p in gh_api(
+        f"repos/{rc['repo']}/pulls?state=open&per_page=100")}
+    since_dt = (datetime.fromisoformat(rs["last_check"])
+                - timedelta(seconds=rc["since_overlap_sec"]))
+    since = since_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rlog(f"scan: {len(prs)} open PR(s) since {since}")
+    candidates = []
+    for c in gh_api(
+            f"repos/{rc['repo']}/issues/comments"
+            f"?since={since}&per_page=100"):
+        n = ref_num(c.get("issue_url"), "issues")
+        if n in prs:
+            c["_kind"], c["_pr"] = "issue", n
+            candidates.append(c)
+    for c in gh_api(
+            f"repos/{rc['repo']}/pulls/comments"
+            f"?since={since}&per_page=100"):
+        n = ref_num(c.get("pull_request_url"), "pulls")
+        if n in prs:
+            c["_kind"], c["_pr"] = "review", n
+            candidates.append(c)
+
+    rs["last_check"] = datetime.now(timezone.utc).isoformat()
+
+    fresh = [c for c in candidates
+             if str(c["id"]) not in seen
+             and rc["trigger_re"].fullmatch((c.get("body") or "").strip())]
+    fresh.sort(key=lambda c: c.get("created_at", ""))
+
+    if SEED_ONLY or first_run:
+        for c in fresh:
+            seen[str(c["id"])] = {"status": "seeded", "pr": c["_pr"]}
+        rlog(f"seeded {len(fresh)} existing trigger comment(s), "
+             "no reviews spawned")
+        return
+
+    busy_units = active_review_units(
+        f"{rc['unit_prefix']}-{rc['slug']}"
+        if len(CFG["repos"]) > 1 else rc["unit_prefix"])
 
     def reap(e):
         """Free a finished daemon session: delete it (or just kill the
@@ -675,21 +809,21 @@ def main():
             e.pop("session", None)
             return
         try:
-            if CFG["keep_sessions"]:
+            if rc["keep_sessions"]:
                 DAEMON.call("kill_session", session=sid)
             else:
                 DAEMON.call("delete_session", session=sid)
             sessions[sid] = {"state": "dead"}
             e.pop("session", None)
         except DaemonError as ex:
-            log(f"reaping session {sid} failed: {ex} — retry next cycle")
+            rlog(f"reaping session {sid} failed: {ex} — retry next cycle")
 
     def discard(e):
         """Forget a failed session (killed or dead without verdict) —
         like reap but best-effort and skipped under keep_sessions."""
         sid = e.get("session")
         if sid and DAEMON is not None and sid in sessions \
-                and not CFG["keep_sessions"]:
+                and not rc["keep_sessions"]:
             try:
                 DAEMON.call("delete_session", session=sid)
             except DaemonError:
@@ -704,24 +838,25 @@ def main():
         if e.get("status") != "spawned":
             continue
         a = entry_alive(e, sessions, busy_units)
-        if a is None and not timed_out(e):
+        if a is None and not timed_out(rc, e):
             continue
-        if a and e.get("session") and timed_out(e) and DAEMON is not None:
+        if a and e.get("session") and timed_out(rc, e) \
+                and DAEMON is not None:
             try:
                 DAEMON.call("kill_session", session=e["session"])
                 sessions[e["session"]] = {"state": "dead"}
                 discard(e)
             except DaemonError as ex:
-                log(f"kill_session {e['session']} failed: {ex}")
+                rlog(f"kill_session {e['session']} failed: {ex}")
                 continue
-            log(f"review for comment {cid} on PR #{e['pr_num']}: "
-                f"timed out after {CFG['review_timeout']} — killed")
+            rlog(f"review for comment {cid} on PR #{e['pr_num']}: "
+                 f"timed out after {rc['review_timeout']} — killed")
             a = False
-        res = review_posted(e)
+        res = review_posted(rc, e)
         if res is True:
             e["status"] = "done"
-            log(f"review for comment {cid} on PR #{e['pr_num']}: "
-                "posted — done")
+            rlog(f"review for comment {cid} on PR #{e['pr_num']}: "
+                 "posted — done")
             reap(e)
         elif res is False and not a:
             e["status"] = "queued"
@@ -729,8 +864,8 @@ def main():
             discard(e)
             e.pop("unit", None)
             e.pop("session", None)
-            log(f"review for comment {cid} on PR #{e['pr_num']}: "
-                "session ended without a posted review — re-queued")
+            rlog(f"review for comment {cid} on PR #{e['pr_num']}: "
+                 "session ended without a posted review — re-queued")
 
     for e in seen.values():
         if e.get("status") == "done" and e.get("session"):
@@ -758,10 +893,10 @@ def main():
         if pr_pending(c["_pr"]):
             seen[cid] = {"status": "ignored-duplicate", "pr_num": c["_pr"],
                          "created_at": c.get("created_at")}
-            log(f"ignoring duplicate trigger on PR #{c['_pr']} "
-                f"(comment {cid}): a request is already queued or running")
+            rlog(f"ignoring duplicate trigger on PR #{c['_pr']} "
+                 f"(comment {cid}): a request is already queued or running")
             if not DRY_RUN:
-                post_ack(pr, c, duplicate=True)
+                post_ack(rc, pr, c, duplicate=True)
             continue
         entry = {
             "status": "queued",
@@ -778,19 +913,27 @@ def main():
         }
         seen[cid] = entry
         queued.append(entry)
-        log(f"queued '{CFG['trigger']}' on PR #{c['_pr']} "
-            f"(comment {cid} by @{c.get('user', {}).get('login')})")
+        rlog(f"queued '{rc['trigger']}' on PR #{c['_pr']} "
+             f"(comment {cid} by @{c.get('user', {}).get('login')})")
 
     # Busy = live tracked refs + foreign units/sessions occupying slots.
     # Untracked daemon sessions only count via the service provenance —
     # a session merely parked in the sidebar group is not a review.
+    # Sessions owned by another repo of this instance don't consume this
+    # repo's slots; unclaimed foreign sessions conservatively count
+    # against every repo.
     by_ref = {}
     busy_refs = set(busy_units)
     if sessions:
         for m in sessions.values():
-            if m.get("origin") == DAEMON_ORIGIN \
-                    and m.get("state") not in DEAD_STATES:
-                busy_refs.add(m.get("id"))
+            sid = m.get("id")
+            if m.get("origin") != DAEMON_ORIGIN \
+                    or m.get("state") in DEAD_STATES:
+                continue
+            owner = claimed_sids.get(sid)
+            if owner is not None and owner != rc["repo"]:
+                continue
+            busy_refs.add(sid)
     for cid, e in seen.items():
         if e.get("status") == "spawned" and spawned_ref(e):
             by_ref[spawned_ref(e)] = (cid, e)
@@ -798,16 +941,16 @@ def main():
                 busy_refs.add(spawned_ref(e))
 
     q_prs = len({e["pr_num"] for e in queued})
-    log(f"queue: {len(queued)} pending review request(s) on {q_prs} PR(s), "
-        f"{len(busy_refs)}/{CFG['max_parallel']} slot(s) busy")
+    rlog(f"queue: {len(queued)} pending review request(s) on {q_prs} PR(s), "
+         f"{len(busy_refs)}/{rc['max_parallel']} slot(s) busy")
     for u in sorted(busy_refs):
         if u in by_ref:
             cid, e = by_ref[u]
             author = (e.get("comment", {}).get("user") or {}).get("login", "?")
-            log(f"in-flight: PR #{e.get('pr_num')} comment {cid} (@{author})"
-                f" — {u}, running {fmt_age(e.get('ts'))}")
+            rlog(f"in-flight: PR #{e.get('pr_num')} comment {cid} (@{author})"
+                 f" — {u}, running {fmt_age(e.get('ts'))}")
         else:
-            log(f"in-flight: {u} (untracked)")
+            rlog(f"in-flight: {u} (untracked)")
 
     def busy_worktrees():
         # Worktree dirs in use — every in-flight entry plus live foreign
@@ -818,15 +961,14 @@ def main():
                   if e.get("status") == "spawned" and e.get("unit"))
         return wt
 
-    slots = CFG["max_parallel"] - len(busy_refs)
+    slots = rc["max_parallel"] - len(busy_refs)
     if slots <= 0 or not queued:
         if not DRY_RUN:
             for i, e in enumerate(queued):
                 if not e.get("ack"):
-                    post_ack(e["pr"], e["comment"], queue_pos=i + 1)
+                    post_ack(rc, e["pr"], e["comment"], queue_pos=i + 1)
                     e["ack"] = True
-        cleanup_worktrees(busy_worktrees())
-        save_state(state)
+        cleanup_worktrees(rc, busy_worktrees())
         return
 
     for e in queued:
@@ -834,8 +976,8 @@ def main():
             break
         if e["pr_num"] not in prs:
             e["status"] = "skipped-closed"
-            log(f"queued comment {e['comment']['id']} skipped: "
-                f"PR #{e['pr_num']} is no longer open")
+            rlog(f"queued comment {e['comment']['id']} skipped: "
+                 f"PR #{e['pr_num']} is no longer open")
             continue
         e["attempts"] += 1
         try:
@@ -845,25 +987,258 @@ def main():
                 and (x.get("pr_num") or x.get("pr")) == e["pr_num"]
                 for x in seen.values())
             e["unit"], sid = spawn_review(
-                e["pr"], e["comment"], follow_up)
+                rc, e["pr"], e["comment"], follow_up)
             if sid:
                 e["session"] = sid
                 sessions[sid] = {"id": sid, "state": "starting",
-                                 "group": CFG["group"]}
+                                 "group": rc["group"]}
             e["status"] = "dry-run" if DRY_RUN else "spawned"
-            e["worktree"] = os.path.join(CFG["worktree_root"], e["unit"])
+            e["worktree"] = os.path.join(rc["worktree_root"], e["unit"])
             if not DRY_RUN:
-                post_ack(e["pr"], e["comment"], unit=sid or e["unit"])
+                post_ack(rc, e["pr"], e["comment"], unit=sid or e["unit"])
                 slots -= 1
         except Exception as ex:
-            if e["attempts"] >= CFG["max_attempts"]:
+            if e["attempts"] >= rc["max_attempts"]:
                 e["status"] = "failed"
-            log(f"spawn failed for queued comment {e['comment']['id']} "
-                f"(attempt {e['attempts']}): {ex}")
+            rlog(f"spawn failed for queued comment {e['comment']['id']} "
+                 f"(attempt {e['attempts']}): {ex}")
         e["ts"] = datetime.now(timezone.utc).isoformat()
 
-    cleanup_worktrees(busy_worktrees())
+    cleanup_worktrees(rc, busy_worktrees())
+
+
+def main():
+    os.makedirs(CFG["state_dir"], exist_ok=True)
+    lock = open(CFG["lock_file"], "w")
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    state = load_state()
+    try:
+        sessions = daemon_setup(state)
+    except RuntimeError:
+        save_state(state)
+        raise
+
+    # session id -> repo owning it (one state file = one owner registry,
+    # so a review session only consumes slots in its own namespace).
+    claimed = {}
+    for name, ns in state["repos"].items():
+        for e in ns.get("comments", {}).values():
+            if e.get("session") and e.get("status") == "spawned":
+                claimed[e["session"]] = name
+
+    for rc in CFG["repos"]:
+        try:
+            poll_repo(rc, state["repos"].setdefault(rc["repo"], {}),
+                      sessions, claimed)
+        except Exception as ex:
+            log(f"[{rc['repo']}] cycle failed: {ex}")
     save_state(state)
+
+
+VERDICT_RE = re.compile(
+    r"##\s*Verdict:\s*(APPROVED|CONDITIONAL|REJECTED)", re.IGNORECASE)
+VERDICT_EXIT = {"APPROVED": 0, "CONDITIONAL": 4, "REJECTED": 5}
+# 2 doubles as argparse's own usage-error code — bad invocation or a
+# broken environment are indistinguishable to the caller anyway.
+EXIT_INFRA, EXIT_NORESULT = 2, 3
+
+
+def rfail(msg):
+    print(f"agent-reviewer: review: {msg}", file=sys.stderr)
+    sys.exit(EXIT_INFRA)
+
+
+def local_review_prompt(path, base):
+    return f"""You are reviewing a LOCAL git diff — there is no pull request and nothing must be posted to GitHub.
+
+Context:
+- Worktree (your working directory): {path}
+- Diff under review: `{base}...HEAD`
+
+Instructions:
+1. Read the diff `git diff {base}...HEAD` (and `git log --oneline {base}..HEAD` for commit context). If the diff is empty, say so briefly and stop.
+2. Analyze ONLY the changes and their direct integration with the code they touch — same rigor as a PR review: correctness, security, regressions, missing tests.
+3. Write the review as your reply in this session. Do NOT post it anywhere (no `gh`, no PR comments).
+4. End your review message with EXACTLY ONE verdict line:
+- `## Verdict: APPROVED` — no blocking issue; the change can be merged
+- `## Verdict: CONDITIONAL` — mergeable once the listed conditions are addressed
+- `## Verdict: REJECTED` — blocking issues must be fixed before merge
+"""
+
+
+def verdict_from_runs(runs):
+    """runs = message texts (contiguous agent_text runs). Returns
+    (verdict|None, body): the last run carrying a Verdict line is the
+    review; otherwise a concatenated tail for diagnostics."""
+    for text in reversed(runs):
+        m = VERDICT_RE.search(text or "")
+        if m:
+            return m.group(1).upper(), text
+    tail = "\n\n".join(r for r in runs if r)[-4000:]
+    return None, tail or "(no output captured)"
+
+
+def cmd_review(args):
+    """`agent-reviewer review --path WT --base REF` — review a local diff.
+    Daemon backend when an endpoint is reachable (auto/daemon mode),
+    direct foreground agent execution otherwise (and in mode=systemd)."""
+    global CFG, DAEMON
+    CFG = load_config(args.config, allow_missing=True)
+    path = expand(args.path)
+    base = args.base
+    if not os.path.isdir(path):
+        rfail(f"no such directory: {path}")
+    for chk, what in (
+            (["rev-parse", "--git-dir"], "not a git worktree"),
+            (["rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"],
+             f"unknown ref '{base}'")):
+        out = subprocess.run(["git", "-C", path, *chk],
+                             capture_output=True, text=True, timeout=30)
+        if out.returncode != 0:
+            rfail(f"{path}: {what}")
+
+    # Agent/daemon defaults: primary repo config when present, globals
+    # otherwise — the local worktree needs no repo_dir/worktree_root.
+    rc = dict(CFG["repos"][0]) if CFG["repos"] else dict(CFG)
+    rc.setdefault("slug", "local")
+    if args.timeout:
+        rc["review_timeout_sec"] = args.timeout
+        rc["review_timeout"] = f"{args.timeout}s"
+    timeout = rc.get("review_timeout_sec") or 10800
+    prompt = local_review_prompt(path, base)
+    title = (f"local review {os.path.basename(path.rstrip('/'))} "
+             f"({base}...HEAD)")
+    log(f"local review: {path} {base}...HEAD (timeout "
+        f"{rc['review_timeout']})")
+
+    DAEMON = None
+    if CFG["mode"] != "systemd":
+        DAEMON = Daemon(daemon_endpoints())
+        try:
+            DAEMON.call("list_sessions")
+        except DaemonError:
+            DAEMON = None
+        if DAEMON is None and CFG["mode"] == "daemon":
+            rfail("mode=daemon but no AgentControl endpoint is "
+                  "reachable")
+    if DAEMON is not None:
+        rc["repo"] = rc.get("repo") or "local"
+        sid = daemon_session(rc, path, title, prompt)
+        log(f"local review session {sid} spawned")
+        if args.detach:
+            print(sid)
+            return 0
+        verdict, body = wait_daemon_review(rc, sid, timeout)
+    else:
+        if args.detach:
+            rfail("--detach requires a reachable daemon endpoint")
+        if CFG["mode"] == "systemd":
+            log("mode=systemd — running the agent in the foreground")
+        else:
+            log("no daemon endpoint — running the agent in the "
+                "foreground")
+        verdict, body = run_direct_review(rc, path, prompt, timeout)
+
+    if args.out:
+        with open(args.out, "w") as f:
+            f.write(body.rstrip() + "\n")
+        log(f"review written to {args.out}")
+    print("\n" + body.rstrip())
+    code = VERDICT_EXIT.get(verdict, EXIT_NORESULT)
+    log(f"local review: verdict={verdict or 'none'} → exit {code}")
+    return code
+
+
+def wait_daemon_review(rc, sid, timeout):
+    """Poll the session until a Verdict line appears in its events, the
+    session dies, or the timeout hits. Reaps like a PR review.
+    agent_text arrives in streamed chunks — group contiguous runs into
+    whole messages so a chunked review is not truncated."""
+    deadline = time.time() + timeout
+    runs, cur, after, dead = [], [], 0, False
+    has_verdict = False
+
+    def flush():
+        if cur:
+            runs.append("".join(cur))
+            cur.clear()
+
+    while time.time() < deadline and not has_verdict:
+        try:
+            ev = DAEMON.call("events", session=sid,
+                             after_seq=after, limit=200)
+            for e in ev.get("events", []):
+                after = max(after, int(e.get("seq") or 0))
+                if e.get("type") == "agent_text" and e.get("text"):
+                    cur.append(e["text"])
+                    if VERDICT_RE.search("".join(cur)):
+                        has_verdict = True
+                else:
+                    flush()
+        except DaemonError as ex:
+            log(f"events {sid}: {ex} — retrying")
+        if has_verdict:
+            break
+        try:
+            info = DAEMON.call("session_info", session=sid)
+            state = ((info or {}).get("meta") or {}).get("state", "dead")
+        except DaemonError:
+            state = "dead"
+        # A one-shot review is over when the session dies — or when the
+        # agent ends its turn and parks idle/waiting_input having already
+        # produced output (there is no GitHub oracle here: silence is the
+        # signal). An idle session with no events yet is still ramping up.
+        if state in DEAD_STATES:
+            dead = True
+            break
+        if state in ("idle", "waiting_input") and (cur or runs):
+            break
+        time.sleep(5)
+    flush()
+    timed = time.time() >= deadline and not dead and not has_verdict
+    if timed:
+        log(f"local review timed out after {rc['review_timeout']} — "
+            f"killing {sid}")
+        try:
+            DAEMON.call("kill_session", session=sid)
+        except DaemonError as ex:
+            log(f"kill_session {sid}: {ex}")
+    try:
+        if rc["keep_sessions"]:
+            if not dead and not timed:
+                DAEMON.call("kill_session", session=sid)
+        else:
+            DAEMON.call("delete_session", session=sid)
+    except DaemonError as ex:
+        log(f"session cleanup {sid}: {ex}")
+    return verdict_from_runs(runs)
+
+
+def run_direct_review(rc, path, prompt, timeout):
+    """Fallback backend: run the configured agent in the worktree and
+    parse its stdout for the Verdict line."""
+    fd, pfile = tempfile.mkstemp(
+        dir=CFG["state_dir"] if os.path.isdir(CFG["state_dir"]) else None,
+        prefix="prompt-local-", suffix=".txt", text=True)
+    with os.fdopen(fd, "w") as f:
+        f.write(prompt)
+    argv, env = agent_argv_env(rc, path, {"prompt_file": pfile})
+    try:
+        out = subprocess.run(
+            [rc["agent_cmd"], *argv], cwd=path, env=env,
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as ex:
+        tail = (ex.stdout or "")[-4000:] if isinstance(
+            ex.stdout, str) else ""
+        return None, (f"(local review timed out — no verdict)\n{tail}"
+                      .rstrip())
+    finally:
+        os.unlink(pfile)
+    if out.returncode != 0 and not VERDICT_RE.search(out.stdout):
+        return None, (f"(agent exited {out.returncode})\n"
+                      f"{out.stderr.strip()[-2000:]}")
+    return verdict_from_runs([out.stdout])
 
 
 def cli():
@@ -873,6 +1248,20 @@ def cli():
                     version=f"%(prog)s {__version__}")
     ap.add_argument("--config", default=os.environ.get(
         "AGENTREVIEWER_CONFIG", expand(DEFAULT_CONFIG)))
+    sub = ap.add_subparsers(dest="cmd")
+    rp = sub.add_parser(
+        "review", help="review a local diff BASE...HEAD in a worktree "
+                       "(no PR required)")
+    rp.add_argument("--path", required=True, metavar="DIR",
+                    help="existing git worktree to review")
+    rp.add_argument("--base", required=True, metavar="REF",
+                    help="base ref, e.g. origin/next_release")
+    rp.add_argument("--out", metavar="FILE",
+                    help="also write the review body to FILE")
+    rp.add_argument("--timeout", type=int, metavar="SEC",
+                    help="override review_timeout")
+    rp.add_argument("--detach", action="store_true",
+                    help="daemon mode: print the session id and exit")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--seed", action="store_true")
     ap.add_argument("--watch", action="store_true",
@@ -883,10 +1272,15 @@ def cli():
                         "AGENTREVIEWER_INTERVAL", "60")),
                     help="seconds between cycles in --watch mode")
     args = ap.parse_args()
+    if args.cmd == "review":
+        sys.exit(cmd_review(args))
 
     DRY_RUN = args.dry_run
     SEED_ONLY = args.seed
     CFG = load_config(args.config)
+    if not CFG["repos"]:
+        sys.exit(f"agent-reviewer: config '{args.config}': "
+                 "no repository configured (set repo/repo_dir or repos[])")
 
     while True:
         try:

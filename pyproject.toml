@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentreviewer"
-version = "0.2.0"
+version = "0.3.0"
 description = "Self-hosted GitHub PR review bot — spawns AI review sessions on trigger comments"
 readme = "README.md"
 requires-python = ">=3.11"

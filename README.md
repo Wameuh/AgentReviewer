@@ -1,9 +1,11 @@
 # AgentReviewer
 
-Self-hosted GitHub PR review bot. A watcher polls a repository every minute;
-when someone posts a bare trigger comment (e.g. `/agent review`) on an open
-PR, an AI agent session is spawned in a dedicated git worktree, reviews the
-diff, and posts a `## Verdict: …` review back as a PR comment.
+Self-hosted GitHub PR review bot. A watcher polls one or more repositories
+every minute; when someone posts a bare trigger comment (e.g.
+`/agent review`) on an open PR, an AI agent session is spawned in a
+dedicated git worktree, reviews the diff, and posts a `## Verdict: …`
+review back as a PR comment. A `review` subcommand also reviews a local
+worktree diff before it is ever pushed.
 
 Two spawn backends:
 
@@ -120,7 +122,8 @@ See `config.example.toml` — every option is commented. Highlights:
 | `mode`             | auto             | `daemon` \| `systemd` spawn backend        |
 | `daemon`           | env/default      | endpoint: `unix`, `unix:/path`, `tcp:h:p`  |
 | `group`            | `AgentReviewer`  | sidebar group for review sessions          |
-| `keep_sessions`    | `false`          | keep session+ journal after `done`         |
+| `keep_sessions`    | `false`          | keep the session journal after `done`      |
+| `repos`            | `[]`             | extra watched repos (array of tables)      |
 | `session_title`    | `review {repo} #{pr}` | title template (`{repo}` `{pr}` `{unit}` `{cid}`) |
 | `[agent] command`  | `devin`          | agent executable / daemon profile basename |
 | `[agent] profile`  | basename(command)| daemon profile for `new_session`           |
@@ -129,10 +132,55 @@ See `config.example.toml` — every option is commented. Highlights:
 | `[agent] env`      | `{}`             | extra env vars — systemd mode only         |
 | `[agent] path_extra` | `[]`           | extra PATH entries — systemd mode only     |
 
-Watching several repos: deploy one `config.toml` + scheduling pair per
-repo, each with a distinct `unit_prefix`, `state_dir`, and `worktree_root`.
-In daemon mode the sessions of several watchers share the `AgentReviewer`
-group — worktrees and state stay per-watcher.
+### Watching several repos
+
+One instance can watch N repositories. Keep the top-level `repo` /
+`repo_dir` / `worktree_root` (the "primary") and add a `repos` entry per
+extra repo — each requires `repo` + `repo_dir` and may override
+`worktree_root`, `trigger`, `group`, `session_title`, `max_parallel`,
+`keep_sessions`, `post_acks`, `marker`, the timeout/scan keys, and a
+nested `agent` table; everything falls back to the top-level defaults:
+
+```toml
+repos = [ { repo = "o/lib", repo_dir = "/srv/lib", max_parallel = 2 } ]
+# or [[repos]] repo = "o/lib" repo_dir = "/srv/lib" trigger = "/check"
+```
+
+`state.json` is namespaced per repo (`repos."o/lib".comments`), existing
+state migrates into the primary namespace automatically, and worktree /
+unit / session names get a repo-slug suffix in multi-repo mode — two repos
+with the same PR number or GitHub comment id never interfere. Queue,
+slots, acks and session reaping are all per repo. A config without a
+top-level `repo` is fine too: `repos` entries only.
+
+## `agent-reviewer review` — local diff before push
+
+Review an **already existing** worktree diff `<base>...HEAD` — no PR, no
+GitHub posting, no worktree creation:
+
+```sh
+agent-reviewer [--config cfg.toml] review --path <worktree> --base <ref>
+               [--out FILE] [--timeout SEC] [--detach]
+```
+
+The agent gets the same verdict contract (`## Verdict: APPROVED |
+CONDITIONAL | REJECTED`) as its session reply. With a reachable daemon
+endpoint (auto/`daemon` mode) the review runs as an `AgentReviewer`-
+grouped session like PR reviews; otherwise (`systemd` mode or no
+endpoint) the configured agent runs in the foreground — `--detach`
+(daemon only) prints the session id and returns immediately.
+
+The review body is printed to stdout and also written to `--out` when
+given.
+Exit codes:
+
+| Code | Meaning                                |
+|------|----------------------------------------|
+| `0`  | `## Verdict: APPROVED`                  |
+| `4`  | `## Verdict: CONDITIONAL`               |
+| `5`  | `## Verdict: REJECTED`                  |
+| `3`  | session/agent ended without a verdict or timed out (`review_timeout` / `--timeout`) |
+| `2`  | usage or infrastructure error (bad path/ref, no endpoint in `mode=daemon`, …) |
 
 ## Notes
 
