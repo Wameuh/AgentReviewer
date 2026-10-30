@@ -1,0 +1,16 @@
+[Unit]
+Description=Scan GitHub PRs for review-trigger comments (AgentReviewer)
+Documentation=https://github.com/Wameuh/AgentReviewer
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=AGENTREVIEWER_CONFIG=%h/.config/agentreviewer/config.toml
+ExecStart=%h/.local/bin/agent-reviewer
+TimeoutStartSec=2min
+StateDirectory=agentreviewer
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=%S/agentreviewer

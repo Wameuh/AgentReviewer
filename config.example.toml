@@ -1,0 +1,80 @@
+# AgentReviewer configuration — copy to ~/.config/agentreviewer/config.toml
+# Paths support ~ and environment variables.
+
+# --- Watched repository -------------------------------------------------------
+
+# GitHub repo to watch for trigger comments, "owner/name". REQUIRED.
+repo = "owner/repo"
+
+# Local clone of that repo, used only to create review worktrees
+# (`git worktree add` runs here; it must have `origin` pointing at GitHub).
+# REQUIRED.
+repo_dir = "/path/to/local/clone"
+
+# Directory under which a fresh worktree is created per review
+# (named after the systemd unit, removed automatically when the review ends).
+# REQUIRED.
+worktree_root = "/path/to/review-worktrees"
+
+# --- Trigger ------------------------------------------------------------------
+
+# Comment that requests a review. Matched as a BARE comment only
+# (whitespace-flexible, case-insensitive) — quoting it inside a longer
+# comment does not trigger.
+trigger = "/agent review"
+
+# --- Queue / scheduling -------------------------------------------------------
+
+# How many review sessions may run concurrently (each in its own worktree).
+max_parallel = 1
+
+# Hard per-review timeout (systemd RuntimeMaxSec — accepts "3h", "90min", …).
+review_timeout = "3h"
+
+# Respawn attempts before a request is marked failed.
+max_attempts = 5
+
+# GitHub comment indexing lags a few seconds; the `since` window is
+# overlapped by this many seconds. Dedup is by comment id — safe to keep.
+since_overlap_sec = 600
+
+# Prefix of the transient systemd units that run reviews.
+unit_prefix = "agentreviewer"
+
+# HTML marker the agent must append to its review comment; also used to
+# detect that a review was actually posted.
+marker = "agentreviewer"
+
+# Post "Launching / queued / duplicate" acknowledgements on the PR.
+post_acks = true
+
+# Where state, prompts and watcher.log live. The environment variable
+# AGENTREVIEWER_STATE_DIR overrides this.
+# state_dir = "~/.local/state/agentreviewer"
+
+# --- Review agent -------------------------------------------------------------
+
+[agent]
+# Executable spawned per review via `systemd-run --user`.
+command = "devin"
+
+# Argument list; placeholders {prompt_file} {model} {repo} {pr} {worktree}
+# are substituted at spawn time. The prompt file instructs the agent to
+# read the PR diff and post back a `## Verdict: …` comment.
+args = [
+  "--model", "{model}",
+  "--permission-mode", "dangerous",
+  "--respect-workspace-trust", "false",
+  "--prompt-file", "{prompt_file}",
+  "--print",
+]
+
+model = "swe-2-max"
+
+# Extra directories prepended to the agent's PATH (nvm's latest node bin
+# dir is appended automatically when present).
+# path_extra = ["~/bin"]
+
+# Extra environment variables passed to the review unit (API keys, …).
+# [agent.env]
+# SOME_TOKEN = "…"

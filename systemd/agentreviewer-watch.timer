@@ -1,0 +1,10 @@
+[Unit]
+Description=Run an AgentReviewer scan every minute
+
+[Timer]
+OnCalendar=minutely
+Persistent=true
+Unit=agentreviewer-watch.service
+
+[Install]
+WantedBy=timers.target
