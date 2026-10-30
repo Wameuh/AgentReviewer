@@ -40,6 +40,8 @@ import time
 import tomllib
 from datetime import datetime, timedelta, timezone
 
+__version__ = "0.2.0"
+
 DEFAULT_CONFIG = "~/.config/agentreviewer/config.toml"
 DEFAULT_DAEMON_SOCK = "~/.agentcontrol/daemon.sock"
 DEFAULT_AGENT_ARGS = [
@@ -867,6 +869,8 @@ def main():
 def cli():
     global DRY_RUN, SEED_ONLY, CFG
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--version", action="version",
+                    version=f"%(prog)s {__version__}")
     ap.add_argument("--config", default=os.environ.get(
         "AGENTREVIEWER_CONFIG", expand(DEFAULT_CONFIG)))
     ap.add_argument("--dry-run", action="store_true")
